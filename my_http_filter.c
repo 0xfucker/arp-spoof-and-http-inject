@@ -37,14 +37,10 @@ static void my_print_tcp_hdr(struct tcphdr *tcp)
 	        ntohs(tcp->window), tcp->urg_ptr, tcp->doff * 4);
 }
 
-static int my_http_filter(struct nfq_data *tb)
+static int my_http_filter(unsigned char *data, int data_len)
 {
-	unsigned char *data;
-	struct iphdr * iph;
+	struct iphdr * iph = (struct iphdr *)data;	
 	int i;
-
-	nfq_get_payload(tb, &data);	
-	iph = (struct iphdr *)data;	
 
 	if (iph->protocol = IPPROTO_TCP) { 
 		/* Skip the size of the IP Header. iph->ihl contains the number of 32 bit
@@ -61,7 +57,7 @@ static int my_http_filter(struct nfq_data *tb)
 
 		my_print_ip_hdr(iph);
 		my_print_tcp_hdr(tcp);
-		printf("payload (len=%d):\n", http_payload_len);
+		printf("payload (len=%d / %d):\n", http_payload_len, data_len);
 
 		for (i = 0; i < http_payload_len; i++) {
 			if (http[i] == '\r')
@@ -143,14 +139,17 @@ static uint32_t print_pkt (struct nfq_data *tb)
 }
 	
 
-static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-	      struct nfq_data *nfa, void *data)
+static int my_callbk(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+	      struct nfq_data *nfa, void *d)
 {
+	unsigned char *data;
+	int data_len;
+	data_len = nfq_get_payload(nfa, &data);	
 	uint32_t id = print_pkt(nfa);
-	if (my_http_filter(nfa))
+	if (my_http_filter(data, data_len))
 		return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 	else
-		return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+		return nfq_set_verdict(qh, id, NF_ACCEPT, data_len, data);
 }
 
 int main(int argc, char **argv)
@@ -190,7 +189,7 @@ int main(int argc, char **argv)
 	}
 
 	printf("binding this socket to queue '%d'\n", queue);
-	qh = nfq_create_queue(h, queue, &cb, NULL);
+	qh = nfq_create_queue(h, queue, &my_callbk, NULL);
 	if (!qh) {
 		fprintf(stderr, "error during nfq_create_queue()\n");
 		exit(1);

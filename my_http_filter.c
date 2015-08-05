@@ -37,11 +37,9 @@ static void my_print_tcp_hdr(struct tcphdr *tcp)
 	        ntohs(tcp->window), tcp->urg_ptr, tcp->doff * 4);
 }
 
-static int my_http_filter(unsigned char *data, int data_len)
+int my_print_non_0_http(unsigned char *data, int data_len)
 {
 	struct iphdr * iph = (struct iphdr *)data;	
-	int i;
-
 	if (iph->protocol = IPPROTO_TCP) { 
 		/* Skip the size of the IP Header. iph->ihl contains the number of 32 bit
 		   words that represent the header size. Therfore to get the number of bytes
@@ -50,41 +48,85 @@ static int my_http_filter(unsigned char *data, int data_len)
 
 		char *http = ((char *)tcp + (tcp->doff << 2));
 		int http_payload_len = ntohs(iph->tot_len) - iph->ihl * 4 - tcp->doff * 4; 
-		char *http_copy = malloc(http_payload_len + 1);
 
 		if (http_payload_len == 0)
 			return 0;
 
+		if (data_len != ntohs(iph->tot_len)) {
+			printf("<<<<<<<<<<<<<<\n");
+			printf("bad!\n");
+			printf(">>>>>>>>>>>>>>\n");
+			return 0;
+		}
+		printf("total len: reported:%d / header:%d \n", data_len, ntohs(iph->tot_len));
 		my_print_ip_hdr(iph);
 		my_print_tcp_hdr(tcp);
-		printf("payload (len=%d / %d):\n", http_payload_len, data_len);
-
+		printf("payload (len=%d):\n", http_payload_len);
+		int i;
 		for (i = 0; i < http_payload_len; i++) {
 			if (http[i] == '\r')
 				printf("\\r");
 			else
 				printf("%c", http[i]);
-			
-			http_copy[i] = http[i];
 		}
-		http_copy[i] = '\n';
 		printf("\n");
 
+		return data_len - http_payload_len;
+	}
+	return 0;
+}
+
+char *my_http_copy(unsigned char *data, int data_len, int offset)
+{
+	char *http = (char *)data + offset;
+	int http_payload_len = data_len - offset; 
+
+	char *http_copy = malloc(http_payload_len + 1);
+	int i;
+	for (i = 0; i < http_payload_len; i++) {
+		http_copy[i] = http[i];
+	}
+	http_copy[i] = '\0';
+	return http_copy;
+}
+
+static int my_http_filter(unsigned char *data, int data_len)
+{
+	int offset = my_print_non_0_http(data, data_len);
+	char *http_copy;
+
+	if (offset > 0) { 
+		// printf("http copy:\n%s--------\n", http_copy);
+		http_copy = my_http_copy(data, data_len, offset);
+
+		int res = 0;
+	
 		/* block all .png file requests */
-		if (strstr(http_copy, ".png HTTP/1.1") == NULL) {
-			printf("[accept]\n");
-			return 0;
+		if (strstr(http_copy, ".png HTTP/1.1")) {
+			printf("[blocked]\n");
+			res = 1;
+		/* modify all .css file requests */
+		} else if (strstr(http_copy, ".css HTTP/1.1")) {
+			char *http = (char *)data + offset;
+			char *p = strstr(http, ".css HTTP/1.1");
+			p[1] = 'e';
+			p[2] = 'x';
+			p[3] = 'e';
+			printf("[modified]\n");
+		/* accept other requests */
 		} else {
-			printf("[bloking]\n");
-			return 1;
+			printf("[accepted]\n");
 		}
+
+		free(http_copy);
+		return res;
 	}
 
 	return 0;
 }
 
 /* returns packet id */
-static uint32_t print_pkt (struct nfq_data *tb)
+static uint32_t my_get_packet_id(struct nfq_data *tb)
 {
 	int id = 0;
 	struct nfqnl_msg_packet_hdr *ph;
@@ -96,44 +138,7 @@ static uint32_t print_pkt (struct nfq_data *tb)
 	ph = nfq_get_msg_packet_hdr(tb);
 	if (ph) {
 		id = ntohl(ph->packet_id);
-		//printf("hw_protocol=0x%04x hook=%u id=%u ",
-		//	ntohs(ph->hw_protocol), ph->hook, id);
 	}
-
-//	hwph = nfq_get_packet_hw(tb);
-//	if (hwph) {
-//		int i, hlen = ntohs(hwph->hw_addrlen);
-//
-//		printf("hw_src_addr=");
-//		for (i = 0; i < hlen-1; i++)
-//			printf("%02x:", hwph->hw_addr[i]);
-//		printf("%02x ", hwph->hw_addr[hlen-1]);
-//	}
-//
-//	mark = nfq_get_nfmark(tb);
-//	if (mark)
-//		printf("mark=%u ", mark);
-//
-//	ifi = nfq_get_indev(tb);
-//	if (ifi)
-//		printf("indev=%u ", ifi);
-//
-//	ifi = nfq_get_outdev(tb);
-//	if (ifi)
-//		printf("outdev=%u ", ifi);
-//	ifi = nfq_get_physindev(tb);
-//	if (ifi)
-//		printf("physindev=%u ", ifi);
-//
-//	ifi = nfq_get_physoutdev(tb);
-//	if (ifi)
-//		printf("physoutdev=%u ", ifi);
-//
-//	ret = nfq_get_payload(tb, &data);
-//	if (ret >= 0)
-//		printf("payload_len=%d ", ret);
-//
-//	fputc('\n', stdout);
 
 	return id;
 }
@@ -145,11 +150,12 @@ static int my_callbk(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	unsigned char *data;
 	int data_len;
 	data_len = nfq_get_payload(nfa, &data);	
-	uint32_t id = print_pkt(nfa);
+	uint32_t id = my_get_packet_id(nfa);
 	if (my_http_filter(data, data_len))
 		return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
-	else
+	else {
 		return nfq_set_verdict(qh, id, NF_ACCEPT, data_len, data);
+	}
 }
 
 int main(int argc, char **argv)
@@ -228,13 +234,6 @@ int main(int argc, char **argv)
 
 	printf("unbinding from queue\n");
 	nfq_destroy_queue(qh);
-
-#ifdef INSANE
-	/* normally, applications SHOULD NOT issue this command, since
-	 * it detaches other programs/sockets from AF_INET, too ! */
-	printf("unbinding from AF_INET\n");
-	nfq_unbind_pf(h, AF_INET);
-#endif
 
 	printf("closing library handle\n");
 	nfq_close(h);

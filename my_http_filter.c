@@ -13,11 +13,34 @@
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
 #include <string.h>
+#include <time.h>
 
 struct my_data {
 	unsigned char *data;
 	int data_len;
 };
+
+char *http_time() 
+{
+	static char buf[1024];
+	time_t now = time(0);
+	struct tm *tm = gmtime(&now);
+	strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S %Z", tm);
+	return buf;
+}
+
+char *http_header(int http_len)
+{
+	static char header[4097];
+	sprintf(header, 
+	       "HTTP/1.1 200 OK\r\n"
+	       "Date: %s\r\n"
+	       "Server: Apache/2.4.7 (Ubuntu)\r\n"
+	       "Content-Length: %d\r\n"
+	       "Content-Type: application/javascript\r\n"
+	       "\r\n", http_time(), http_len);
+	return header;
+}
 
 static void my_print_ip_hdr(struct iphdr *iph)
 {
@@ -76,7 +99,7 @@ int my_print_non_0_http(unsigned char *data, int data_len)
 			else
 				printf("%c", http[i]);
 		}
-		printf("\n");
+		printf("\n~~END~~\n");
 
 		return data_len - http_payload_len;
 	}
@@ -119,25 +142,30 @@ struct my_data my_read_file(const char *fname)
 
 struct my_data my_replace_http(unsigned char *data, const char *fname)
 {
-	struct my_data res, new_payload = my_read_file(fname);
-	if (new_payload.data == NULL)
-		return new_payload;
+	struct my_data res, http_content = my_read_file(fname);
+	if (http_content.data == NULL)
+		return http_content;
 
-	struct iphdr *iph = (struct iphdr *)data;	
+	struct iphdr *iph = (struct iphdr *)data;
 	struct tcphdr *tcp = ((struct tcphdr *) (data + (iph->ihl << 2)));
 	int ip_len = ntohs(iph->tot_len);
-	int http_payload_len = ip_len - iph->ihl * 4 - tcp->doff * 4; 
-	int http_offset = ip_len - http_payload_len;
+	int ip_hdr_len = iph->ihl * 4;
+	int http_offset = ip_hdr_len + tcp->doff * 4;
 
-	res.data_len = http_offset + new_payload.data_len;
+	char *http_hdr = http_header(http_content.data_len);
+	int http_hdr_len = strlen(http_hdr);
+
+	res.data_len = http_offset + http_hdr_len + http_content.data_len;
 	res.data = malloc(res.data_len);
 
 	memcpy(res.data, data, http_offset);
-	memcpy(res.data + http_offset, new_payload.data, new_payload.data_len);
+	memcpy(res.data + http_offset, http_hdr, http_hdr_len);
+	memcpy(res.data + http_offset + http_hdr_len, 
+	       http_content.data, http_content.data_len);
 
-	free(new_payload.data);
+	free(http_content.data);
 	
-	struct iphdr *new_iph = (struct iphdr *)res.data;	
+	struct iphdr *new_iph = (struct iphdr *)res.data;
 	new_iph->tot_len = htons(res.data_len);
 	new_iph->check = 0xdeaf;
 
@@ -170,11 +198,16 @@ int my_http_filter(struct nfq_q_handle *qh, uint32_t id,
 				printf("[modification failed]\n");
 				verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 			} else {
+#if 1
 				printf("[modifying]\n");
 				my_print_non_0_http(res.data, res.data_len);
 				printf("[modified]\n");
 				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 
 				                          res.data_len, res.data);
+#else
+				printf("[accepted]\n");
+				verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+#endif
 				free(res.data);
 			}
 		/* accept other requests */
@@ -302,18 +335,19 @@ int main(int argc, char **argv)
 	exit(0);
 }
 
-int test_my_read_file()
+int _main()
 {
-	struct my_data res;
-	res = my_read_file("replace.js");
+//	struct my_data res;
+//	res = my_read_file("replace.js");
+//
+//	if (res.data == NULL) {
+//		printf("NULL!\n");
+//	} else {
+//		printf("%s", res.data);
+//	}
+//
+//	free(res.data);
 
-	if (res.data == NULL) {
-		printf("NULL!\n");
-	} else {
-		printf("%s", res.data);
-	}
-
-	free(res.data);
-
-	return 1;
+	printf("%s\n", http_header(123));
+	return 0;
 }

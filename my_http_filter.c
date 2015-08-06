@@ -12,7 +12,12 @@
 
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
-#include <string.h> // find substring
+#include <string.h>
+
+struct my_data {
+	unsigned char *data;
+	int data_len;
+};
 
 static void my_print_ip_hdr(struct iphdr *iph)
 {
@@ -44,6 +49,8 @@ int my_print_non_0_http(unsigned char *data, int data_len)
 		/* Skip the size of the IP Header. iph->ihl contains the number of 32 bit
 		   words that represent the header size. Therfore to get the number of bytes
 		   multiple this number by 4 */
+		// The number of 32 bit words in the tcp header which will most probably be 
+		// five (5) unless you use options.
 		struct tcphdr *tcp = ((struct tcphdr *) (data + (iph->ihl << 2)));
 
 		char *http = ((char *)tcp + (tcp->doff << 2));
@@ -90,39 +97,97 @@ char *my_http_copy(unsigned char *data, int data_len, int offset)
 	return http_copy;
 }
 
-static int my_http_filter(unsigned char *data, int data_len)
+struct my_data my_read_file(const char *fname)
+{
+	struct my_data res = {NULL, 0};
+	FILE *fh = fopen(fname, "r");
+
+	if (fh == NULL)
+		return res;
+
+	fseek(fh, 0, SEEK_END);
+	res.data_len = ftell(fh);
+	fseek(fh, 0, SEEK_SET);
+
+	res.data = malloc(res.data_len + 1);
+	fread(res.data, res.data_len, 1, fh);
+	res.data[res.data_len] = '\0';
+	
+	fclose(fh);
+	return res;
+}
+
+struct my_data my_replace_http(unsigned char *data, const char *fname)
+{
+	struct my_data res, new_payload = my_read_file(fname);
+	if (new_payload.data == NULL)
+		return new_payload;
+
+	struct iphdr *iph = (struct iphdr *)data;	
+	struct tcphdr *tcp = ((struct tcphdr *) (data + (iph->ihl << 2)));
+	int ip_len = ntohs(iph->tot_len);
+	int http_payload_len = ip_len - iph->ihl * 4 - tcp->doff * 4; 
+	int http_offset = ip_len - http_payload_len;
+
+	res.data_len = http_offset + new_payload.data_len;
+	res.data = malloc(res.data_len);
+
+	memcpy(res.data, data, http_offset);
+	memcpy(res.data + http_offset, new_payload.data, new_payload.data_len);
+
+	free(new_payload.data);
+	
+	struct iphdr *new_iph = (struct iphdr *)res.data;	
+	new_iph->tot_len = htons(res.data_len);
+	new_iph->check = 0xdeaf;
+
+	struct tcphdr *new_tcp = ((struct tcphdr *)(res.data + (new_iph->ihl << 2)));
+	new_tcp->check = 0xbad1;
+
+	return res;
+}
+
+int my_http_filter(struct nfq_q_handle *qh, uint32_t id,
+                   unsigned char *data, int data_len)
 {
 	int offset = my_print_non_0_http(data, data_len);
 	char *http_copy;
+	int verdict;
 
 	if (offset > 0) { 
 		// printf("http copy:\n%s--------\n", http_copy);
 		http_copy = my_http_copy(data, data_len, offset);
-
-		int res = 0;
 	
 		/* block all .png file requests */
 		if (strstr(http_copy, ".png HTTP/1.1")) {
 			printf("[blocked]\n");
-			res = 1;
+			verdict = nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 		/* modify all .css file requests */
-		} else if (strstr(http_copy, ".css HTTP/1.1")) {
-			char *http = (char *)data + offset;
-			char *p = strstr(http, ".css HTTP/1.1");
-			p[1] = 'e';
-			p[2] = 'x';
-			p[3] = 'e';
-			printf("[modified]\n");
+		} else if (strstr(http_copy, "application/javascript")) {
+			struct my_data res = {NULL, 0};
+			res = my_replace_http(data, "replace.js");
+			if (res.data == NULL) {
+				printf("[modification failed]\n");
+				verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+			} else {
+				printf("[modifying]\n");
+				my_print_non_0_http(res.data, res.data_len);
+				printf("[modified]\n");
+				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 
+				                          res.data_len, res.data);
+				free(res.data);
+			}
 		/* accept other requests */
 		} else {
 			printf("[accepted]\n");
+			verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 		}
 
 		free(http_copy);
-		return res;
+		return verdict;
 	}
 
-	return 0;
+	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 }
 
 /* returns packet id */
@@ -145,17 +210,13 @@ static uint32_t my_get_packet_id(struct nfq_data *tb)
 	
 
 static int my_callbk(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-	      struct nfq_data *nfa, void *d)
+                     struct nfq_data *nfa, void *d)
 {
 	unsigned char *data;
 	int data_len;
 	data_len = nfq_get_payload(nfa, &data);	
 	uint32_t id = my_get_packet_id(nfa);
-	if (my_http_filter(data, data_len))
-		return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
-	else {
-		return nfq_set_verdict(qh, id, NF_ACCEPT, data_len, data);
-	}
+	return my_http_filter(qh, id, data, data_len);
 }
 
 int main(int argc, char **argv)
@@ -239,4 +300,20 @@ int main(int argc, char **argv)
 	nfq_close(h);
 
 	exit(0);
+}
+
+int test_my_read_file()
+{
+	struct my_data res;
+	res = my_read_file("replace.js");
+
+	if (res.data == NULL) {
+		printf("NULL!\n");
+	} else {
+		printf("%s", res.data);
+	}
+
+	free(res.data);
+
+	return 1;
 }

@@ -1,3 +1,2 @@
-alert('clash');
-alert('of');
-alert('clans');
+alert("Hackers\'");
+alert("Party!");

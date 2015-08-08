@@ -112,7 +112,8 @@ static void print_tcp_hdr(struct tcphdr *tcp)
 	        tcp->check);
 }
 
-int print_non_0_http(unsigned char *data, int data_len)
+int print_non_0_http(unsigned char *data, int data_len, 
+                     unsigned int print_pos)
 {
 	struct iphdr * iph = (struct iphdr *)data;
 	if (iph->protocol = IPPROTO_TCP) { 
@@ -136,19 +137,23 @@ int print_non_0_http(unsigned char *data, int data_len)
 			return 0;
 		}
 
-		printf("\n");
-		printf("IP packet len: %d\n", data_len);
-		print_ip_hdr(iph);
-		print_tcp_hdr(tcp);
-		printf("TCP payload (len=%d):\n", tcp_payload_len);
-		int i;
-		for (i = 0; i < tcp_payload_len; i++) {
-			if (http[i] == '\r')
-				printf("\\r");
-			else
-				printf("%c", http[i]);
+		if (print_pos == 0) {
+			printf("\n");
+			printf("IP packet len: %d\n", data_len);
+			print_ip_hdr(iph);
+			print_tcp_hdr(tcp);
+
+		} else {
+			printf("TCP payload (len=%d):\n", tcp_payload_len);
+			int i;
+			for (i = 0; i < tcp_payload_len; i++) {
+				if (http[i] == '\r')
+					printf("\\r");
+				else
+					printf("%c", http[i]);
+			}
+			printf("\n");
 		}
-		printf("\n");
 
 		return data_len - tcp_payload_len;
 	}
@@ -238,7 +243,7 @@ struct data replace_http(unsigned char *data, const char *fname)
 int http_filter(struct nfq_q_handle *qh, uint32_t id,
                    unsigned char *data, int data_len)
 {
-	int offset = print_non_0_http(data, data_len);
+	int offset = print_non_0_http(data, data_len, 0);
 	char *http_copy;
 	int verdict;
 	struct data res = {NULL, 0};
@@ -247,20 +252,24 @@ int http_filter(struct nfq_q_handle *qh, uint32_t id,
 		// printf("http copy:\n%s--------\n", http_copy);
 		http_copy = copy_http_str(data, data_len, offset);
 
-		if (strstr(http_copy, ".png HTTP/1.1")) {
+		if (strstr(http_copy, "some pattern we wanna block")) {
 			/* blocking requests */
 			printf("[blocked]\n");
 			verdict = nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 
 		} else if (strstr(http_copy, "application/javascript")) {
 			/* replacing requests */
+			print_non_0_http(data, data_len, 1);
+
 			res = replace_http(data, "replace.js");
 
 			if (res.data == NULL) {
 				printf("error @ line %d!\n", __LINE__);
-				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+				verdict = nfq_set_verdict(qh, id, NF_ACCEPT,
+				                          0, NULL);
 			} else {
-				print_non_0_http(res.data, res.data_len);
+				print_non_0_http(res.data, res.data_len, 0);
+				print_non_0_http(res.data, res.data_len, 1);
 
 				printf("[replaced]\n");
 				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 
@@ -271,6 +280,12 @@ int http_filter(struct nfq_q_handle *qh, uint32_t id,
 
 		} else {
 			/* accepting requests */
+			if (strstr(http_copy, "text/html")) {
+				print_non_0_http(data, data_len, 1);
+			} else if (strstr(http_copy, "text/css")) {
+				print_non_0_http(data, data_len, 1);
+			}
+	
 			printf("[accepted]\n");
 			verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 		}
@@ -371,9 +386,10 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		/* if your application is too slow to digest the packets that
-		 * are sent from kernel-space, the socket buffer that we use
-		 * to enqueue packets may fill up returning ENOBUFS.  */
+		/* if your application is too slow to digest the packets 
+		 * that are sent from kernel-space, the socket buffer 
+		 * that we use to enqueue packets may fill up returning 
+		 * ENOBUFS. */
 		if (rv < 0 && errno == ENOBUFS) {
 			printf("losing packets!\n");
 			continue;

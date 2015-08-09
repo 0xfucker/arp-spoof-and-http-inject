@@ -1,4 +1,4 @@
-all: arp-poison.out my_http_filter.out
+all: arp-poison.out http-inject.out
 
 %.out: %.c
 	gcc $^ -lnetfilter_queue -o $@

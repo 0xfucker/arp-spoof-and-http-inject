@@ -112,8 +112,20 @@ static void print_tcp_hdr(struct tcphdr *tcp)
 	        tcp->check);
 }
 
+static void print_char(char c)
+{
+	if (c == '\r')
+		printf("\\r");
+	else if (c == '\t' || c == '\n')
+		printf("%c", c);
+	else if (' ' <= c && c <= '~')
+		printf("%c", c);
+	else
+		printf("?");
+}
+
 int print_non_0_http(unsigned char *data, int data_len, 
-                     unsigned int print_pos)
+                     unsigned int en_print)
 {
 	struct iphdr * iph = (struct iphdr *)data;
 	if (iph->protocol = IPPROTO_TCP) { 
@@ -137,20 +149,16 @@ int print_non_0_http(unsigned char *data, int data_len,
 			return 0;
 		}
 
-		if (print_pos == 0) {
+		if (en_print) {
 			printf("\n");
 			printf("IP packet len: %d\n", data_len);
 			print_ip_hdr(iph);
 			print_tcp_hdr(tcp);
 
-		} else {
 			printf("TCP payload (len=%d):\n", tcp_payload_len);
 			int i;
 			for (i = 0; i < tcp_payload_len; i++) {
-				if (http[i] == '\r')
-					printf("\\r");
-				else
-					printf("%c", http[i]);
+				print_char(http[i]);
 			}
 			printf("\n");
 		}
@@ -257,34 +265,37 @@ int http_filter(struct nfq_q_handle *qh, uint32_t id,
 			printf("[blocked]\n");
 			verdict = nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 
-		} else if (strstr(http_copy, "application/javascript")) {
-			/* replacing requests */
-			print_non_0_http(data, data_len, 1);
-
-			res = replace_http(data, "replace.js");
-
-			if (res.data == NULL) {
-				printf("error @ line %d!\n", __LINE__);
-				verdict = nfq_set_verdict(qh, id, NF_ACCEPT,
-				                          0, NULL);
-			} else {
-				print_non_0_http(res.data, res.data_len, 0);
-				print_non_0_http(res.data, res.data_len, 1);
-
-				printf("[replaced]\n");
-				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 
-				                          res.data_len, res.data);
-			}
-
-			free(res.data);
-
+//		} else if (strstr(http_copy, "application/javascript")) {
+//			/* replacing requests */
+//			print_non_0_http(data, data_len, 1);
+//
+//			res = replace_http(data, "replace.js");
+//
+//			if (res.data == NULL) {
+//				printf("error @ line %d!\n", __LINE__);
+//				verdict = nfq_set_verdict(qh, id, NF_ACCEPT,
+//				                          0, NULL);
+//			} else {
+//				print_non_0_http(res.data, res.data_len, 0);
+//				print_non_0_http(res.data, res.data_len, 1);
+//
+//				printf("[replaced]\n");
+//				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 
+//				                          res.data_len, res.data);
+//			}
+//
+//			free(res.data);
+//
 		} else {
 			/* accepting requests */
-			if (strstr(http_copy, "text/html")) {
+			if (strstr(http_copy, "text/html"))
 				print_non_0_http(data, data_len, 1);
-			} else if (strstr(http_copy, "text/css")) {
+			else if (strstr(http_copy, "application/javascript"))
 				print_non_0_http(data, data_len, 1);
-			}
+			else if (strstr(http_copy, "POST /"))
+				print_non_0_http(data, data_len, 1);
+			else if (strstr(http_copy, "GET /"))
+				print_non_0_http(data, data_len, 1);
 	
 			printf("[accepted]\n");
 			verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);

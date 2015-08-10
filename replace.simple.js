@@ -1,0 +1,2 @@
+alert("Hackers\'");
+alert("Party!");

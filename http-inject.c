@@ -88,7 +88,7 @@ static void print_ip_hdr(struct iphdr *iph)
 	// display IP HEADERS : ip.h line 45
 	fprintf(stdout, "IP{v=%u; ihl=%u; tos=%u; tot_len=%u; "
 	                "id=%u; frag_off=%u; ttl=%u; protocol=%u; "
-	                COLOR_RED "checksum=%x; " COLOR_RST,
+	                 COLOR_RED "checksum=%x; " COLOR_RST,
 	                 iph->version, iph->ihl * 4, iph->tos, 
 	                 ntohs(iph->tot_len), ntohs(iph->id), 
 	                 iph->frag_off, iph->ttl, iph->protocol, 
@@ -114,19 +114,28 @@ static void print_tcp_hdr(struct tcphdr *tcp)
 	        tcp->check);
 }
 
-static void print_char(char c)
+static void print_abstract(struct iphdr *iph, struct tcphdr *tcp)
 {
-	if (c == '\r')
-		printf("\\r");
-	else if (c == '\t' || c == '\n')
-		printf("%c", c);
-	else if (' ' <= c && c <= '~')
-		printf("%c", c);
-	else
-		printf("?");
+	char src_ip[64];
+	strcpy(src_ip, inet_ntoa(*(struct in_addr *)&iph->saddr));
+	char *dest_ip = inet_ntoa(*(struct in_addr *)&iph->daddr);
+	fprintf(stdout,"%s:%u --> %s:%u \n", src_ip, ntohs(tcp->source),
+	                                     dest_ip, ntohs(tcp->dest));
+	printf("[");
+	if (tcp->syn)
+		fprintf(stdout, "SYN ");
+	if (tcp->ack)
+		fprintf(stdout, "ACK ");
+	if (tcp->rst)
+		fprintf(stdout, "RST ");
+	if (tcp->fin)
+		fprintf(stdout, "FIN ");
+	printf("]");
+
+	printf("seq: %u, ack: %u", ntohl(tcp->seq), ntohl(tcp->ack_seq));
 }
 
-int print_non_0_http(unsigned char *data, int data_len, 
+int print_http(unsigned char *data, int data_len, 
                      unsigned int en_print)
 {
 	struct iphdr * iph = (struct iphdr *)data;
@@ -142,9 +151,8 @@ int print_non_0_http(unsigned char *data, int data_len,
 		char *http = ((char *)tcp + (tcp->doff << 2));
 		int tcp_payload_len = ntohs(iph->tot_len) 
 		                    - iph->ihl * 4 - tcp->doff * 4; 
-
-		if (tcp_payload_len == 0)
-			return 0;
+//		printf("tcp total len: %d\n", ntohs(iph->tot_len));
+//		printf("tcp_payload len: %d\n", tcp_payload_len);
 
 		if (data_len != ntohs(iph->tot_len)) {
 			printf("error @ line %d!\n", __LINE__);
@@ -153,16 +161,22 @@ int print_non_0_http(unsigned char *data, int data_len,
 
 		if (en_print) {
 			printf("\n");
-			printf("IP packet len: %d\n", data_len);
-			print_ip_hdr(iph);
-			print_tcp_hdr(tcp);
+//			print_ip_hdr(iph);
+//			print_tcp_hdr(tcp);
+			print_abstract(iph, tcp);
+			printf("(TCP payload len=%d)\n", tcp_payload_len);
 
-			printf("TCP payload (len=%d):\n", tcp_payload_len);
-			int i;
-			for (i = 0; i < tcp_payload_len; i++) {
-				print_char(http[i]);
+			{ /* print HTTP */
+				char *c = malloc(tcp_payload_len + 1);
+				memcpy(c, http, tcp_payload_len);
+				c[tcp_payload_len] = '\0';
+
+				printf("%s", c);
+				printf("\n");
+
+				fflush(stdout);
+				free(c);
 			}
-			printf("\n");
 		}
 
 		return data_len - tcp_payload_len;
@@ -173,7 +187,7 @@ int print_non_0_http(unsigned char *data, int data_len,
 char *copy_http_str(unsigned char *data, int len, int offset)
 {
 	char *http = (char *)data + offset;
-	int tcp_payload_len = len - offset; 
+	int tcp_payload_len = len - offset;
 
 	char *http_copy = malloc(tcp_payload_len + 1);
 	int i;
@@ -253,7 +267,7 @@ struct data replace_http(unsigned char *data, const char *fname)
 int http_filter(struct nfq_q_handle *qh, uint32_t id,
                    unsigned char *data, int data_len)
 {
-	int offset = print_non_0_http(data, data_len, 0);
+	int offset = print_http(data, data_len, 0);
 	char *http_copy;
 	int verdict;
 	struct data res = {NULL, 0};
@@ -269,7 +283,7 @@ int http_filter(struct nfq_q_handle *qh, uint32_t id,
 
 		} else if (strstr(http_copy, REPLACE_PATTERN)) {
 			/* replacing requests */
-			print_non_0_http(data, data_len, 1);
+			print_http(data, data_len, 1);
 
 			res = replace_http(data, "replace.js");
 
@@ -278,8 +292,8 @@ int http_filter(struct nfq_q_handle *qh, uint32_t id,
 				verdict = nfq_set_verdict(qh, id, NF_ACCEPT,
 				                          0, NULL);
 			} else {
-				print_non_0_http(res.data, res.data_len, 0);
-				print_non_0_http(res.data, res.data_len, 1);
+				print_http(res.data, res.data_len, 0);
+				print_http(res.data, res.data_len, 1);
 
 				printf("[replaced]\n");
 				verdict = nfq_set_verdict(qh, id, NF_ACCEPT, 
@@ -289,21 +303,11 @@ int http_filter(struct nfq_q_handle *qh, uint32_t id,
 			free(res.data);
 
 		} else {
-
-			if (strstr(http_copy, "application/javascript")) {
-				print_non_0_http(data, data_len, 1);
-			}
 			/* accepting requests */
-//			if (strstr(http_copy, "text/html"))
-//				print_non_0_http(data, data_len, 1);
-//			else if (strstr(http_copy, "application/javascript"))
-//				print_non_0_http(data, data_len, 1);
-//			else if (strstr(http_copy, "POST /"))
-//				print_non_0_http(data, data_len, 1);
-//			else if (strstr(http_copy, "GET /"))
-//				print_non_0_http(data, data_len, 1);
-//	
-//			printf("[accepted]\n");
+			if (strstr(http_copy, "GET /"))
+				print_http(data, data_len, 1);
+
+			printf("[accepted]\n");
 			verdict =  nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 		}
 
